@@ -3,6 +3,7 @@ import json
 import boto3
 from datetime import datetime
 import uuid
+import os
 
 from backend.services.logging import get_logger
 from backend.core.config import get_settings

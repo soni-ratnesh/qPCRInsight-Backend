@@ -1,5 +1,5 @@
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from datetime import datetime
 import uuid
 
@@ -36,7 +36,6 @@ class PresignResponse(BaseModel):
 @router.post("/presign", response_model=PresignResponse)
 async def create_presigned_upload(
     request: PresignRequest,
-    authorization: str = Header(None),
     user: Dict[str, Any] = Depends(get_current_user)
 ) -> PresignResponse:
     """Create presigned URL for file upload.
@@ -46,7 +45,6 @@ async def create_presigned_upload(
     
     Args:
         request: Presign request data
-        authorization: Authorization header (automatically captured)
         user: Current user information from JWT
         
     Returns:
@@ -137,7 +135,6 @@ class FileListResponse(BaseModel):
 
 @router.get("/list", response_model=FileListResponse)
 async def list_user_files(
-    authorization: str = Header(None),
     user: Dict[str, Any] = Depends(get_current_user),
     limit: int = 100,
     prefix: Optional[str] = None
@@ -145,7 +142,6 @@ async def list_user_files(
     """List files uploaded by the current user.
     
     Args:
-        authorization: Authorization header
         user: Current user information
         limit: Maximum number of files to return
         prefix: Optional prefix to filter files
@@ -206,14 +202,12 @@ async def list_user_files(
 @router.delete("/{file_key:path}")
 async def delete_file(
     file_key: str,
-    authorization: str = Header(None),
     user: Dict[str, Any] = Depends(get_current_user)
 ) -> Dict[str, str]:
     """Delete a file uploaded by the user.
     
     Args:
         file_key: S3 key of the file to delete
-        authorization: Authorization header
         user: Current user information
         
     Returns:

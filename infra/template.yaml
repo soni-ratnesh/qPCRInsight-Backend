@@ -1,12 +1,11 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31 
-Description: qPCR Analysis Platform - Pure CloudFormation
+Transform: AWS::Serverless-2016-10-31
+Description: qPCR Analysis Platform - Complete Working Version
 
 Parameters:
   Environment:
     Type: String
     Default: prod
-    Description: Environment name
 
 Resources:
   # S3 Buckets
@@ -45,8 +44,110 @@ Resources:
           KeyType: HASH
       BillingMode: PAY_PER_REQUEST
 
-  # Lambda Execution Role
-  LambdaExecutionRole:
+  # SQS Queues
+  AnalysisDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-analysis-dlq
+  
+  # Step Functions State Machine
+  AnalysisStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub ${AWS::StackName}-analysis-workflow
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "qPCR Analysis Pipeline",
+          "StartAt": "ParseFile",
+          "States": {
+            "ParseFile": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${AnalysisRunnerFunction}",
+                "Payload": {
+                  "step": "parse",
+                  "job_id.$": "$.job_id",
+                  "file_path.$": "$.file_path",
+                  "file_key.$": "$.file_key"
+                }
+              },
+              "Next": "QualityControl"
+            },
+            "QualityControl": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${AnalysisRunnerFunction}",
+                "Payload": {
+                  "step": "qc",
+                  "job_id.$": "$.job_id",
+                  "data.$": "$.Payload"
+                }
+              },
+              "Next": "CalculateAnalysis"
+            },
+            "CalculateAnalysis": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${AnalysisRunnerFunction}",
+                "Payload": {
+                  "step": "analysis",
+                  "job_id.$": "$.job_id",
+                  "data.$": "$.Payload",
+                  "reference_gene.$": "$.reference_gene",
+                  "control_condition.$": "$.control_condition"
+                }
+              },
+              "Next": "GenerateReports"
+            },
+            "GenerateReports": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${AnalysisRunnerFunction}",
+                "Payload": {
+                  "step": "reports",
+                  "job_id.$": "$.job_id",
+                  "data.$": "$.Payload",
+                  "experiment_name.$": "$.experiment_name"
+                }
+              },
+              "Next": "Complete"
+            },
+            "Complete": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${AnalysisRunnerFunction}",
+                "Payload": {
+                  "step": "complete",
+                  "job_id.$": "$.job_id",
+                  "results.$": "$.Payload"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+  AnalysisRunnerStepFunctionsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: StepFunctionsExecutionPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:StartExecution
+              - states:DescribeExecution
+            Resource: !Ref AnalysisStateMachine
+      Roles:
+        - !Ref AnalysisRunnerFunctionRole
+  # IAM Role for Step Functions
+  StepFunctionsRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -54,141 +155,348 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: lambda.amazonaws.com
+              Service: states.amazonaws.com
             Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: ResourceAccess
+        - PolicyName: InvokeLambdaPolicy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - s3:GetObject
-                  - s3:PutObject
-                  - s3:DeleteObject
-                Resource:
-                  - !Sub ${RawBucket.Arn}/*
-                  - !Sub ${ReportBucket.Arn}/*
-              - Effect: Allow
-                Action:
-                  - dynamodb:GetItem
-                  - dynamodb:PutItem
-                  - dynamodb:UpdateItem
-                Resource: !GetAtt JobTable.Arn
+                  - lambda:InvokeFunction
+                Resource: !GetAtt AnalysisRunnerFunction.Arn
 
-  # API Gateway
-  RestApi:
-    Type: AWS::ApiGateway::RestApi
+  AnalysisQueue:
+    Type: AWS::SQS::Queue
     Properties:
-      Name: !Sub ${AWS::StackName}-api
-      Description: qPCR Analysis API
-      EndpointConfiguration:
-        Types:
-          - REGIONAL
+      QueueName: !Sub ${AWS::StackName}-analysis-queue
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AnalysisDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  # Cognito
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub ${AWS::StackName}-client
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - USER_PASSWORD_AUTH
 
   # Lambda Functions
   UploadPresignFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub ${AWS::StackName}-upload-presign
-      PackageType: Zip
-      Runtime: python3.11
-      CodeUri: ../lambdas/upload_presign/      
+      CodeUri: ../lambdas/upload_presign/
       Handler: handler.lambda_handler
+      Runtime: python3.11
       Timeout: 30
-      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          RAW_BUCKET_NAME: !Ref RawBucket
+          REPORT_BUCKET_NAME: !Ref ReportBucket
+          JOB_TABLE_NAME: !Ref JobTable
+          COGNITO_POOL_ID: "not-configured"
+          COGNITO_CLIENT_ID: "not-configured"
+          REGION: !Ref AWS::Region
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref RawBucket
       Events:
         ApiEvent:
           Type: Api
           Properties:
+            RestApiId: !Ref RestApi
             Path: /files/presign
             Method: POST
 
-
-  # API Gateway Resources
-  FilesResource:
-    Type: AWS::ApiGateway::Resource
+  IngestQueueFunction:
+    Type: AWS::Serverless::Function
     Properties:
-      RestApiId: !Ref RestApi
-      ParentId: !GetAtt RestApi.RootResourceId
-      PathPart: files
+      FunctionName: !Sub ${AWS::StackName}-ingest-queue
+      CodeUri: ../lambdas/ingest_queue/
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 30
+      Environment:
+        Variables:
+          RAW_BUCKET_NAME: !Ref RawBucket
+          REPORT_BUCKET_NAME: !Ref ReportBucket
+          JOB_TABLE_NAME: !Ref JobTable
+          COGNITO_POOL_ID: "not-configured"
+          COGNITO_CLIENT_ID: "not-configured"
+          REGION: !Ref AWS::Region
+          ANALYSIS_QUEUE_URL: !Ref AnalysisQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt AnalysisQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobTable
+        - S3ReadPolicy:
+            BucketName: !Ref RawBucket
 
-  PresignResource:
-    Type: AWS::ApiGateway::Resource
+  SubmitJobFunction:
+    Type: AWS::Serverless::Function
     Properties:
-      RestApiId: !Ref RestApi
-      ParentId: !Ref FilesResource
-      PathPart: presign
+      FunctionName: !Sub ${AWS::StackName}-submit-job
+      CodeUri: ../lambdas/submit_job/
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 30
+      Environment:
+        Variables:
+          RAW_BUCKET_NAME: "not-configured"
+          REPORT_BUCKET_NAME: "not-configured"
+          JOB_TABLE_NAME: !Ref JobTable
+          COGNITO_POOL_ID: "not-configured"
+          COGNITO_CLIENT_ID: "not-configured"
+          REGION: !Ref AWS::Region
+          ANALYSIS_QUEUE_URL: !Ref AnalysisQueue
+          STACK_NAME: !Ref AWS::StackName
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt AnalysisQueue.QueueName
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /jobs/submit
+            Method: POST
 
-  # API Gateway Methods
-  PresignMethod:
-    Type: AWS::ApiGateway::Method
+  GetJobStatusFunction:
+    Type: AWS::Serverless::Function
     Properties:
-      RestApiId: !Ref RestApi
-      ResourceId: !Ref PresignResource
-      HttpMethod: POST
-      AuthorizationType: NONE
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadPresignFunction.Arn}/invocations
+      FunctionName: !Sub ${AWS::StackName}-get-job-status
+      CodeUri: ../lambdas/get_job_status/
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 30
+      Environment:
+        Variables:
+          RAW_BUCKET_NAME: "not-configured"
+          REPORT_BUCKET_NAME: !Ref ReportBucket
+          JOB_TABLE_NAME: !Ref JobTable
+          COGNITO_POOL_ID: "not-configured"
+          COGNITO_CLIENT_ID: "not-configured"
+          REGION: !Ref AWS::Region
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref JobTable
+        - S3ReadPolicy:
+            BucketName: !Ref ReportBucket
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /jobs/{job_id}
+            Method: GET
 
-  PresignOptionsMethod:
-    Type: AWS::ApiGateway::Method
+  AnalysisRunnerFunction:
+    Type: AWS::Serverless::Function
     Properties:
-      RestApiId: !Ref RestApi
-      ResourceId: !Ref PresignResource
-      HttpMethod: OPTIONS
-      AuthorizationType: NONE
-      Integration:
-        Type: MOCK
-        IntegrationResponses:
-          - StatusCode: 200
-            ResponseParameters:
-              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
-              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
-              method.response.header.Access-Control-Allow-Origin: "'*'"
-            ResponseTemplates:
-              application/json: ''
-        RequestTemplates:
-          application/json: '{"statusCode": 200}'
-      MethodResponses:
-        - StatusCode: 200
-          ResponseParameters:
-            method.response.header.Access-Control-Allow-Headers: true
-            method.response.header.Access-Control-Allow-Methods: true
-            method.response.header.Access-Control-Allow-Origin: true
+      FunctionName: !Sub ${AWS::StackName}-analysis-runner
+      CodeUri: ../lambdas/analysis_runner/
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 30  # 15 minutes
+      MemorySize: 1024
+      Environment:
+        Variables:
+          RAW_BUCKET_NAME: !Ref RawBucket
+          REPORT_BUCKET_NAME: !Ref ReportBucket
+          JOB_TABLE_NAME: !Ref JobTable
+          COGNITO_POOL_ID: "not-configured"
+          COGNITO_CLIENT_ID: "not-configured"
+          REGION: !Ref AWS::Region
+          STACK_NAME: !Ref AWS::StackName
 
-  # Lambda Permissions
-  UploadPresignPermission:
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref RawBucket
+        - S3CrudPolicy:
+            BucketName: !Ref ReportBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobTable
+        - SQSPollerPolicy:
+            QueueName: !GetAtt AnalysisQueue.QueueName
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AnalysisQueue.Arn
+            BatchSize: 1
+
+  DownloadResultsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-download-results
+      CodeUri: ../lambdas/download_results/
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 30
+      Environment:
+        Variables:
+          RAW_BUCKET_NAME: "not-configured"
+          REPORT_BUCKET_NAME: !Ref ReportBucket
+          JOB_TABLE_NAME: !Ref JobTable
+          COGNITO_POOL_ID: "not-configured"
+          COGNITO_CLIENT_ID: "not-configured"
+          REGION: !Ref AWS::Region
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref JobTable
+        - S3ReadPolicy:
+            BucketName: !Ref ReportBucket
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /jobs/{job_id}/download
+            Method: GET
+
+
+  # Lambda Permissions for S3
+  IngestQueueS3Permission:
     Type: AWS::Lambda::Permission
     Properties:
-      FunctionName: !Ref UploadPresignFunction
+      FunctionName: !GetAtt IngestQueueFunction.Arn
       Action: lambda:InvokeFunction
-      Principal: apigateway.amazonaws.com
-      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub ${RawBucket.Arn}
 
-  # API Deployment
-  ApiDeployment:
-    Type: AWS::ApiGateway::Deployment
-    DependsOn:
-      - PresignMethod
-      - PresignOptionsMethod
+  # Custom Resource to set up S3 notification (avoids circular dependency)
+  S3NotificationSetupFunction:
+    Type: AWS::Serverless::Function
     Properties:
-      RestApiId: !Ref RestApi
+      FunctionName: !Sub ${AWS::StackName}-s3-notification-setup
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 30
+      InlineCode: |
+        import json
+        import boto3
+        import cfnresponse
+        
+        def lambda_handler(event, context):
+            try:
+                s3 = boto3.client('s3')
+                
+                if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                    bucket_name = event['ResourceProperties']['BucketName']
+                    lambda_arn = event['ResourceProperties']['LambdaArn']
+                    
+                    notification_config = {
+                        'LambdaFunctionConfigurations': [
+                            {
+                                'Id': 'IngestQueueNotification',
+                                'LambdaFunctionArn': lambda_arn,
+                                'Events': ['s3:ObjectCreated:*'],
+                                'Filter': {
+                                    'Key': {
+                                        'FilterRules': [
+                                            {
+                                                'Name': 'prefix',
+                                                'Value': 'raw/'
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                    
+                    s3.put_bucket_notification_configuration(
+                        Bucket=bucket_name,
+                        NotificationConfiguration=notification_config
+                    )
+                
+                elif event['RequestType'] == 'Delete':
+                    bucket_name = event['ResourceProperties']['BucketName']
+                    s3.put_bucket_notification_configuration(
+                        Bucket=bucket_name,
+                        NotificationConfiguration={}
+                    )
+                
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                
+            except Exception as e:
+                print(f"Error: {str(e)}")
+                cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetBucketNotification
+                - s3:PutBucketNotification
+              Resource: !Sub ${RawBucket.Arn}
+
+  S3NotificationCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: IngestQueueS3Permission
+    Properties:
+      ServiceToken: !GetAtt S3NotificationSetupFunction.Arn
+      BucketName: !Ref RawBucket
+      LambdaArn: !GetAtt IngestQueueFunction.Arn
+
+  # API Gateway
+  RestApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-api
       StageName: prod
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
 
 Outputs:
   ApiUrl:
     Description: API Gateway endpoint URL
     Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod
-  
+
   RawBucketName:
     Description: S3 bucket for raw uploads
     Value: !Ref RawBucket
-  
+
   ReportBucketName:
     Description: S3 bucket for reports
     Value: !Ref ReportBucket
+
+  JobTableName:
+    Description: DynamoDB table for jobs
+    Value: !Ref JobTable
+
+  AnalysisQueueUrl:
+    Description: SQS queue for analysis jobs
+    Value: !Ref AnalysisQueue
+
+  CognitoPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+
+  CognitoClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+
+  StateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref AnalysisStateMachine

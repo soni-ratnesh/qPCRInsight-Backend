@@ -77,9 +77,14 @@ def lambda_handler(event: Dict[str, Any], context) -> Any:
                 }
                 
                 # Get state machine ARN from environment
-                state_machine_arn = os.environ.get('STATE_MACHINE_ARN')
-                if not state_machine_arn:
-                    raise ValueError("STATE_MACHINE_ARN environment variable not set")
+                stack_name = os.environ.get('STACK_NAME')
+                if not stack_name:
+                    raise ValueError("STACK_NAME environment variable not set")
+
+                # Build state machine ARN from stack name
+                account_id = boto3.client('sts').get_caller_identity()['Account']
+                region = os.environ.get('REGION', 'us-east-1')
+                state_machine_arn = f"arn:aws:states:{region}:{account_id}:stateMachine:{stack_name}-analysis-workflow"
                 
                 # Start execution
                 execution_response = sfn_client.start_execution(
@@ -214,38 +219,20 @@ def _update_job_status(
 
 
 def _update_job_field(job_id: str, field: str, value: Any) -> None:
-    """Update a specific field in the job record.
-    
-    Args:
-        job_id: Job ID
-        field: Field name to update
-        value: New value
-    """
-    settings = get_settings()
-    dynamodb = boto3.resource('dynamodb', region_name=settings.REGION)
-    table = dynamodb.Table(settings.JOB_TABLE_NAME)
-    
-    table.update_item(
-        Key={'job_id': job_id},
-        UpdateExpression=f"SET {field} = :value",
-        ExpressionAttributeValues={':value': value}
-    )
-    expr = "SET #status = :status, updated_at = :timestamp"
-    expr_values = {
-        ':status': status,
-        ':timestamp': datetime.now().isoformat()
-    }
-    expr_names = {
-        '#status': 'status'
-    }
-    
-    if error_message:
-        update_expr += ", error_message = :error"
-        expr_values[':error'] = error_message
-    
-    table.update_item(
-        Key={'job_id': job_id},
-        UpdateExpression=update_expr,
-        ExpressionAttributeValues=expr_values,
-        ExpressionAttributeNames=expr_names
-    )
+   """Update a specific field in the job record.
+   
+   Args:
+       job_id: Job ID
+       field: Field name to update
+       value: New value
+   """
+   settings = get_settings()
+   dynamodb = boto3.resource('dynamodb', region_name=settings.REGION)
+   table = dynamodb.Table(settings.JOB_TABLE_NAME)
+   
+   table.update_item(
+       Key={'job_id': job_id},
+       UpdateExpression=f"SET {field} = :value",
+       ExpressionAttributeValues={':value': value}
+   )
+
