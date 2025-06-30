@@ -37,7 +37,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         _update_job_status(job_id, 'NORMALIZING', progress={'step': 'normalization', 'percentage': 40})
         
         # Load QC data if it's a key
-        if isinstance(qc_data, str):
+        if isinstance(qc_data, dict):
             qc_data = download_json_from_s3(
                 bucket=settings.REPORT_BUCKET_NAME,
                 key=qc_data.get('qc_data_key', qc_data)

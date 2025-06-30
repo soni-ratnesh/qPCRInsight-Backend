@@ -4,7 +4,7 @@ import boto3
 
 from backend.services.logging import get_logger
 from backend.core.config import get_settings
-
+from backend.utils import DecimalEncoder
 logger = get_logger(__name__)
 
 
@@ -81,7 +81,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Any:
                 'Content-Type': 'application/json',
                 'Access-Control-Allow-Origin': '*'
             },
-            'body': json.dumps(result)
+            'body': json.dumps(result, cls=DecimalEncoder)
         }
         
     except Exception as e:

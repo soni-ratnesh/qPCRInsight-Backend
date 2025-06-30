@@ -19,11 +19,11 @@ class Settings(BaseSettings):
         LOG_LEVEL: Logging level (DEBUG, INFO, WARNING, ERROR)
     """
     
-    RAW_BUCKET_NAME: str
-    REPORT_BUCKET_NAME: str
-    JOB_TABLE_NAME: str
-    COGNITO_POOL_ID: str
-    COGNITO_CLIENT_ID: str
+    RAW_BUCKET_NAME: Optional[str] = None
+    REPORT_BUCKET_NAME: Optional[str] = None
+    JOB_TABLE_NAME: Optional[str] = None
+    COGNITO_POOL_ID: Optional[str] = None
+    COGNITO_CLIENT_ID: Optional[str] = None
     REGION: str = "us-east-1"
     LOG_LEVEL: str = "INFO"
     

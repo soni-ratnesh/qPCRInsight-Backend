@@ -9,7 +9,6 @@ Parameters:
 
 Globals:
   Function:
-    Runtime: python3.11
     Timeout: 300
     MemorySize: 1024
     Environment:
@@ -20,6 +19,17 @@ Globals:
         REGION: !Ref AWS::Region
 
 Resources:
+  CommonDepsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub ${AWS::StackName}-common-deps
+      Description: "Shared third-party libs for all functions"
+      ContentUri: ../lambdas/commons          
+      CompatibleRuntimes:
+        - python3.11                     
+    Metadata:                            
+      BuildMethod: python3.11       
+
   # S3 Buckets
   RawBucket:
     Type: AWS::S3::Bucket
@@ -336,6 +346,9 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-parse-file
       CodeUri: ../lambdas/parse_file/
       Handler: handler.lambda_handler
+      Runtime: python3.11
+      Layers:
+        - !Ref CommonDepsLayer  
       Policies:
         - S3ReadPolicy:
             BucketName: !Ref RawBucket
@@ -350,6 +363,9 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-quality-control
       CodeUri: ../lambdas/quality_control/
       Handler: handler.lambda_handler
+      Runtime: python3.11
+      Layers:
+        - !Ref CommonDepsLayer  
       Policies:
         - S3CrudPolicy:
             BucketName: !Ref ReportBucket
@@ -362,6 +378,9 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-normalize-data
       CodeUri: ../lambdas/normalize_data/
       Handler: handler.lambda_handler
+      Runtime: python3.11
+      Layers:
+        - !Ref CommonDepsLayer  
       Policies:
         - S3CrudPolicy:
             BucketName: !Ref ReportBucket
@@ -372,8 +391,10 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub ${AWS::StackName}-fold-change
-      CodeUri: ../lambdas/fold_change/
-      Handler: handler.lambda_handler
+      PackageType: Image
+      ImageUri: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/qpcr-fold-change:latest
+      MemorySize: 2048
+      Timeout: 900
       Policies:
         - S3CrudPolicy:
             BucketName: !Ref ReportBucket
@@ -384,9 +405,10 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub ${AWS::StackName}-stats-worker
-      CodeUri: ../lambdas/stats_worker/
-      Handler: handler.lambda_handler
+      PackageType: Image
+      ImageUri: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/qpcr-stats-worker:latest
       MemorySize: 2048
+      Timeout: 900
       Policies:
         - S3CrudPolicy:
             BucketName: !Ref ReportBucket
@@ -399,6 +421,9 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-plot-worker
       CodeUri: ../lambdas/plot_worker/
       Handler: handler.lambda_handler
+      Runtime: python3.11
+      Layers:
+        - !Ref CommonDepsLayer  
       MemorySize: 2048
       Policies:
         - S3CrudPolicy:
@@ -412,6 +437,9 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-report-builder
       CodeUri: ../lambdas/report_builder/
       Handler: handler.lambda_handler
+      Runtime: python3.11
+      Layers:
+        - !Ref CommonDepsLayer  
       MemorySize: 2048
       Policies:
         - S3CrudPolicy:
@@ -425,6 +453,9 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-notify-complete
       CodeUri: ../lambdas/notify_complete/
       Handler: handler.lambda_handler
+      Runtime: python3.11
+      Layers:
+        - !Ref CommonDepsLayer  
       Environment:
         Variables:
           SES_FROM_EMAIL: !Sub noreply@${AWS::StackName}.com
@@ -440,6 +471,9 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-error-handler
       CodeUri: ../lambdas/error_handler/
       Handler: handler.lambda_handler
+      Runtime: python3.11
+      Layers:
+        - !Ref CommonDepsLayer  
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref JobTable
@@ -452,6 +486,8 @@ Resources:
       CodeUri: ../lambdas/upload_presign/
       Handler: handler.lambda_handler
       Runtime: python3.11
+      Layers:
+        - !Ref CommonDepsLayer  
       Timeout: 30
       Environment:
         Variables:
@@ -475,6 +511,8 @@ Resources:
       CodeUri: ../lambdas/ingest_queue/
       Handler: handler.lambda_handler
       Runtime: python3.11
+      Layers:
+        - !Ref CommonDepsLayer  
       Timeout: 30
       Environment:
         Variables:
@@ -496,6 +534,8 @@ Resources:
       CodeUri: ../lambdas/submit_job/
       Handler: handler.lambda_handler
       Runtime: python3.11
+      Layers:
+        - !Ref CommonDepsLayer  
       Timeout: 30
       Environment:
         Variables:
@@ -523,6 +563,8 @@ Resources:
       CodeUri: ../lambdas/get_job_status/
       Handler: handler.lambda_handler
       Runtime: python3.11
+      Layers:
+        - !Ref CommonDepsLayer  
       Timeout: 30
       Environment:
         Variables:
@@ -548,6 +590,8 @@ Resources:
       CodeUri: ../lambdas/download_results/
       Handler: handler.lambda_handler
       Runtime: python3.11
+      Layers:
+        - !Ref CommonDepsLayer  
       Timeout: 30
       Environment:
         Variables:
@@ -574,6 +618,8 @@ Resources:
       CodeUri: ../lambdas/analysis_runner/
       Handler: handler.lambda_handler
       Runtime: python3.11
+      Layers:
+        - !Ref CommonDepsLayer  
       Timeout: 30
       MemorySize: 1024
       Environment:
@@ -616,6 +662,8 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-s3-notification-setup
       Runtime: python3.11
       Handler: index.lambda_handler
+      Layers:
+        - !Ref CommonDepsLayer  
       Timeout: 30
       InlineCode: |
         import json

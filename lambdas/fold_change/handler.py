@@ -35,7 +35,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         _update_job_status(job_id, 'CALCULATING_FOLD_CHANGE', progress={'step': 'fold_change', 'percentage': 50})
         
         # Load normalized data if it's a key
-        if isinstance(normalized_data, str):
+        if isinstance(normalized_data, dict):
             normalized_data = download_json_from_s3(
                 bucket=settings.REPORT_BUCKET_NAME,
                 key=normalized_data.get('normalized_data_key', normalized_data)
