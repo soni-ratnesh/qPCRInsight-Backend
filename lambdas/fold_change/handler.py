@@ -62,13 +62,13 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         
         # Prepare analysis summary
         analysis_summary = {
-            'n_upregulated': (fold_change_df['regulation'] == 'Upregulated').sum(),
-            'n_downregulated': (fold_change_df['regulation'] == 'Downregulated').sum(),
-            'n_no_change': (fold_change_df['regulation'] == 'No change').sum(),
-            'n_undetermined': (fold_change_df['regulation'] == 'Undetermined').sum(),
+            'n_upregulated': int((fold_change_df['regulation'] == 'Upregulated').sum()),
+            'n_downregulated': int((fold_change_df['regulation'] == 'Downregulated').sum()),
+            'n_no_change': int((fold_change_df['regulation'] == 'No change').sum()),
+            'n_undetermined': int((fold_change_df['regulation'] == 'Undetermined').sum()),
             'fold_change_range': {
-                'min': fold_change_df['fold_change'].min(),
-                'max': fold_change_df['fold_change'].max()
+                'min': float(fold_change_df['fold_change'].min()),
+                'max': float(fold_change_df['fold_change'].max())
             }
         }
         
