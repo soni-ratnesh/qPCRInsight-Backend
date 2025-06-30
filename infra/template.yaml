@@ -1,11 +1,23 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: qPCR Analysis Platform - Complete Working Version
+Description: qPCR Analysis Platform - Optimized with separate Lambda functions
 
 Parameters:
   Environment:
     Type: String
     Default: prod
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 300
+    MemorySize: 1024
+    Environment:
+      Variables:
+        RAW_BUCKET_NAME: !Ref RawBucket
+        REPORT_BUCKET_NAME: !Ref ReportBucket
+        JOB_TABLE_NAME: !Ref JobTable
+        REGION: !Ref AWS::Region
 
 Resources:
   # S3 Buckets
@@ -39,9 +51,18 @@ Resources:
       AttributeDefinitions:
         - AttributeName: job_id
           AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
       KeySchema:
         - AttributeName: job_id
           KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
       BillingMode: PAY_PER_REQUEST
 
   # SQS Queues
@@ -50,7 +71,15 @@ Resources:
     Properties:
       QueueName: !Sub ${AWS::StackName}-analysis-dlq
   
-  # Step Functions State Machine
+  AnalysisQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-analysis-queue
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AnalysisDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  # Step Functions State Machine - Optimized
   AnalysisStateMachine:
     Type: AWS::StepFunctions::StateMachine
     Properties:
@@ -58,94 +87,199 @@ Resources:
       RoleArn: !GetAtt StepFunctionsRole.Arn
       DefinitionString: !Sub |
         {
-          "Comment": "qPCR Analysis Pipeline",
+          "Comment": "qPCR Analysis Pipeline - Optimized",
           "StartAt": "ParseFile",
           "States": {
             "ParseFile": {
               "Type": "Task",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "FunctionName": "${AnalysisRunnerFunction}",
+                "FunctionName": "${ParseFileFunction}",
                 "Payload": {
-                  "step": "parse",
                   "job_id.$": "$.job_id",
-                  "file_path.$": "$.file_path",
                   "file_key.$": "$.file_key"
                 }
               },
-              "Next": "QualityControl"
+              "ResultPath": "$.parse_result",
+              "OutputPath": "$",
+              "Next": "QualityControl",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "HandleError"
+                }
+              ]
             },
             "QualityControl": {
               "Type": "Task",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "FunctionName": "${AnalysisRunnerFunction}",
+                "FunctionName": "${QualityControlFunction}",
                 "Payload": {
-                  "step": "qc",
                   "job_id.$": "$.job_id",
-                  "data.$": "$.Payload"
+                  "parsed_data.$": "$.parse_result.Payload",
+                  "analysis_params.$": "$.analysis_params"
                 }
               },
-              "Next": "CalculateAnalysis"
+              "ResultPath": "$.qc_result",
+              "OutputPath": "$",
+              "Next": "NormalizeData",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "HandleError"
+                }
+              ]
             },
-            "CalculateAnalysis": {
+            "NormalizeData": {
               "Type": "Task",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "FunctionName": "${AnalysisRunnerFunction}",
+                "FunctionName": "${NormalizeDataFunction}",
                 "Payload": {
-                  "step": "analysis",
                   "job_id.$": "$.job_id",
-                  "data.$": "$.Payload",
+                  "qc_data.$": "$.qc_result.Payload",
                   "reference_gene.$": "$.reference_gene",
                   "control_condition.$": "$.control_condition"
                 }
               },
-              "Next": "GenerateReports"
+              "ResultPath": "$.normalize_result",
+              "OutputPath": "$",
+              "Next": "CalculateFoldChange",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "HandleError"
+                }
+              ]
             },
-            "GenerateReports": {
+            "CalculateFoldChange": {
               "Type": "Task",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "FunctionName": "${AnalysisRunnerFunction}",
+                "FunctionName": "${FoldChangeFunction}",
                 "Payload": {
-                  "step": "reports",
                   "job_id.$": "$.job_id",
-                  "data.$": "$.Payload",
-                  "experiment_name.$": "$.experiment_name"
+                  "normalized_data.$": "$.normalize_result.Payload"
                 }
               },
-              "Next": "Complete"
+              "ResultPath": "$.fold_change_result",
+              "OutputPath": "$",
+              "Next": "StatisticalAnalysis",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "HandleError"
+                }
+              ]
+            },
+            "StatisticalAnalysis": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${StatsWorkerFunction}",
+                "Payload": {
+                  "job_id.$": "$.job_id",
+                  "analysis_data.$": "$.fold_change_result.Payload",
+                  "analysis_params.$": "$.analysis_params"
+                }
+              },
+              "ResultPath": "$.stats_result",
+              "OutputPath": "$",
+              "Next": "GeneratePlots",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "HandleError"
+                }
+              ]
+            },
+            "GeneratePlots": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${PlotWorkerFunction}",
+                "Payload": {
+                  "job_id.$": "$.job_id",
+                  "analysis_results.$": "$",
+                  "generate_plots.$": "$.analysis_params.generate_plots"
+                }
+              },
+              "ResultPath": "$.plot_result",
+              "OutputPath": "$",
+              "Next": "BuildReport",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "HandleError"
+                }
+              ]
+            },
+            "BuildReport": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ReportBuilderFunction}",
+                "Payload": {
+                  "job_id.$": "$.job_id",
+                  "experiment_name.$": "$.experiment_name",
+                  "all_results.$": "$"
+                }
+              },
+              "ResultPath": "$.report_result",
+              "OutputPath": "$",
+              "Next": "Complete",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "HandleError"
+                }
+              ]
             },
             "Complete": {
               "Type": "Task",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
-                "FunctionName": "${AnalysisRunnerFunction}",
+                "FunctionName": "${NotifyCompleteFunction}",
                 "Payload": {
-                  "step": "complete",
                   "job_id.$": "$.job_id",
-                  "results.$": "$.Payload"
+                  "report_result.$": "$.report_result.Payload",
+                  "email.$": "$.email",
+                  "email_notification.$": "$.email_notification"
+                }
+              },
+              "End": true
+            },
+            "HandleError": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ErrorHandlerFunction}",
+                "Payload": {
+                  "job_id.$": "$.job_id",
+                  "error.$": "$.error"
                 }
               },
               "End": true
             }
           }
         }
-  AnalysisRunnerStepFunctionsPolicy:
-    Type: AWS::IAM::Policy
-    Properties:
-      PolicyName: StepFunctionsExecutionPolicy
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Action:
-              - states:StartExecution
-              - states:DescribeExecution
-            Resource: !Ref AnalysisStateMachine
-      Roles:
-        - !Ref AnalysisRunnerFunctionRole
+
   # IAM Role for Step Functions
   StepFunctionsRole:
     Type: AWS::IAM::Role
@@ -165,15 +299,16 @@ Resources:
               - Effect: Allow
                 Action:
                   - lambda:InvokeFunction
-                Resource: !GetAtt AnalysisRunnerFunction.Arn
-
-  AnalysisQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      QueueName: !Sub ${AWS::StackName}-analysis-queue
-      RedrivePolicy:
-        deadLetterTargetArn: !GetAtt AnalysisDeadLetterQueue.Arn
-        maxReceiveCount: 3
+                Resource:
+                  - !GetAtt ParseFileFunction.Arn
+                  - !GetAtt QualityControlFunction.Arn
+                  - !GetAtt NormalizeDataFunction.Arn
+                  - !GetAtt FoldChangeFunction.Arn
+                  - !GetAtt StatsWorkerFunction.Arn
+                  - !GetAtt PlotWorkerFunction.Arn
+                  - !GetAtt ReportBuilderFunction.Arn
+                  - !GetAtt NotifyCompleteFunction.Arn
+                  - !GetAtt ErrorHandlerFunction.Arn
 
   # Cognito
   UserPool:
@@ -194,7 +329,122 @@ Resources:
       ExplicitAuthFlows:
         - USER_PASSWORD_AUTH
 
-  # Lambda Functions
+  # Analysis Pipeline Lambda Functions
+  ParseFileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-parse-file
+      CodeUri: ../lambdas/parse_file/
+      Handler: handler.lambda_handler
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref RawBucket
+        - S3WritePolicy:
+            BucketName: !Ref ReportBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobTable
+
+  QualityControlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-quality-control
+      CodeUri: ../lambdas/quality_control/
+      Handler: handler.lambda_handler
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref ReportBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobTable
+
+  NormalizeDataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-normalize-data
+      CodeUri: ../lambdas/normalize_data/
+      Handler: handler.lambda_handler
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref ReportBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobTable
+
+  FoldChangeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-fold-change
+      CodeUri: ../lambdas/fold_change/
+      Handler: handler.lambda_handler
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref ReportBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobTable
+
+  StatsWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-stats-worker
+      CodeUri: ../lambdas/stats_worker/
+      Handler: handler.lambda_handler
+      MemorySize: 2048
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref ReportBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobTable
+
+  PlotWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-plot-worker
+      CodeUri: ../lambdas/plot_worker/
+      Handler: handler.lambda_handler
+      MemorySize: 2048
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref ReportBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobTable
+
+  ReportBuilderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-report-builder
+      CodeUri: ../lambdas/report_builder/
+      Handler: handler.lambda_handler
+      MemorySize: 2048
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref ReportBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobTable
+
+  NotifyCompleteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-notify-complete
+      CodeUri: ../lambdas/notify_complete/
+      Handler: handler.lambda_handler
+      Environment:
+        Variables:
+          SES_FROM_EMAIL: !Sub noreply@${AWS::StackName}.com
+      Policies:
+        - SESCrudPolicy:
+            IdentityName: "*"
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobTable
+
+  ErrorHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-error-handler
+      CodeUri: ../lambdas/error_handler/
+      Handler: handler.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobTable
+
+  # Existing Lambda Functions (API endpoints)
   UploadPresignFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -205,12 +455,8 @@ Resources:
       Timeout: 30
       Environment:
         Variables:
-          RAW_BUCKET_NAME: !Ref RawBucket
-          REPORT_BUCKET_NAME: !Ref ReportBucket
-          JOB_TABLE_NAME: !Ref JobTable
-          COGNITO_POOL_ID: "not-configured"
-          COGNITO_CLIENT_ID: "not-configured"
-          REGION: !Ref AWS::Region
+          COGNITO_POOL_ID: !Ref UserPool
+          COGNITO_CLIENT_ID: !Ref UserPoolClient
       Policies:
         - S3WritePolicy:
             BucketName: !Ref RawBucket
@@ -232,13 +478,9 @@ Resources:
       Timeout: 30
       Environment:
         Variables:
-          RAW_BUCKET_NAME: !Ref RawBucket
-          REPORT_BUCKET_NAME: !Ref ReportBucket
-          JOB_TABLE_NAME: !Ref JobTable
-          COGNITO_POOL_ID: "not-configured"
-          COGNITO_CLIENT_ID: "not-configured"
-          REGION: !Ref AWS::Region
           ANALYSIS_QUEUE_URL: !Ref AnalysisQueue
+          COGNITO_POOL_ID: !Ref UserPool
+          COGNITO_CLIENT_ID: !Ref UserPoolClient
       Policies:
         - SQSSendMessagePolicy:
             QueueName: !GetAtt AnalysisQueue.QueueName
@@ -257,14 +499,10 @@ Resources:
       Timeout: 30
       Environment:
         Variables:
-          RAW_BUCKET_NAME: "not-configured"
-          REPORT_BUCKET_NAME: "not-configured"
-          JOB_TABLE_NAME: !Ref JobTable
-          COGNITO_POOL_ID: "not-configured"
-          COGNITO_CLIENT_ID: "not-configured"
-          REGION: !Ref AWS::Region
           ANALYSIS_QUEUE_URL: !Ref AnalysisQueue
           STACK_NAME: !Ref AWS::StackName
+          COGNITO_POOL_ID: !Ref UserPool
+          COGNITO_CLIENT_ID: !Ref UserPoolClient
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref JobTable
@@ -288,12 +526,8 @@ Resources:
       Timeout: 30
       Environment:
         Variables:
-          RAW_BUCKET_NAME: "not-configured"
-          REPORT_BUCKET_NAME: !Ref ReportBucket
-          JOB_TABLE_NAME: !Ref JobTable
-          COGNITO_POOL_ID: "not-configured"
-          COGNITO_CLIENT_ID: "not-configured"
-          REGION: !Ref AWS::Region
+          COGNITO_POOL_ID: !Ref UserPool
+          COGNITO_CLIENT_ID: !Ref UserPoolClient
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref JobTable
@@ -307,41 +541,6 @@ Resources:
             Path: /jobs/{job_id}
             Method: GET
 
-  AnalysisRunnerFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub ${AWS::StackName}-analysis-runner
-      CodeUri: ../lambdas/analysis_runner/
-      Handler: handler.lambda_handler
-      Runtime: python3.11
-      Timeout: 30  # 15 minutes
-      MemorySize: 1024
-      Environment:
-        Variables:
-          RAW_BUCKET_NAME: !Ref RawBucket
-          REPORT_BUCKET_NAME: !Ref ReportBucket
-          JOB_TABLE_NAME: !Ref JobTable
-          COGNITO_POOL_ID: "not-configured"
-          COGNITO_CLIENT_ID: "not-configured"
-          REGION: !Ref AWS::Region
-          STACK_NAME: !Ref AWS::StackName
-
-      Policies:
-        - S3CrudPolicy:
-            BucketName: !Ref RawBucket
-        - S3CrudPolicy:
-            BucketName: !Ref ReportBucket
-        - DynamoDBCrudPolicy:
-            TableName: !Ref JobTable
-        - SQSPollerPolicy:
-            QueueName: !GetAtt AnalysisQueue.QueueName
-      Events:
-        SQSEvent:
-          Type: SQS
-          Properties:
-            Queue: !GetAtt AnalysisQueue.Arn
-            BatchSize: 1
-
   DownloadResultsFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -352,12 +551,8 @@ Resources:
       Timeout: 30
       Environment:
         Variables:
-          RAW_BUCKET_NAME: "not-configured"
-          REPORT_BUCKET_NAME: !Ref ReportBucket
-          JOB_TABLE_NAME: !Ref JobTable
-          COGNITO_POOL_ID: "not-configured"
-          COGNITO_CLIENT_ID: "not-configured"
-          REGION: !Ref AWS::Region
+          COGNITO_POOL_ID: !Ref UserPool
+          COGNITO_CLIENT_ID: !Ref UserPoolClient
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref JobTable
@@ -371,6 +566,39 @@ Resources:
             Path: /jobs/{job_id}/download
             Method: GET
 
+  # Updated Analysis Runner for Step Functions trigger
+  AnalysisRunnerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-analysis-runner
+      CodeUri: ../lambdas/analysis_runner/
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 1024
+      Environment:
+        Variables:
+          STACK_NAME: !Ref AWS::StackName
+          STATE_MACHINE_ARN: !Ref AnalysisStateMachine
+          COGNITO_POOL_ID: !Ref UserPool
+          COGNITO_CLIENT_ID: !Ref UserPoolClient
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref RawBucket
+        - S3CrudPolicy:
+            BucketName: !Ref ReportBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobTable
+        - SQSPollerPolicy:
+            QueueName: !GetAtt AnalysisQueue.QueueName
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt AnalysisStateMachine.Name
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AnalysisQueue.Arn
+            BatchSize: 1
 
   # Lambda Permissions for S3
   IngestQueueS3Permission:
@@ -381,7 +609,7 @@ Resources:
       Principal: s3.amazonaws.com
       SourceArn: !Sub ${RawBucket.Arn}
 
-  # Custom Resource to set up S3 notification (avoids circular dependency)
+  # Custom Resource to set up S3 notification
   S3NotificationSetupFunction:
     Type: AWS::Serverless::Function
     Properties:

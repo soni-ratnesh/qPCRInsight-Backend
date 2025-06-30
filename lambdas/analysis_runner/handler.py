@@ -1,22 +1,21 @@
+# lambdas/analysis_runner/handler.py
 from typing import Any, Dict, Optional
 import json
 import os
-import tempfile
 
 import boto3
 
 from backend.services.logging import get_logger
 from backend.core.config import get_settings
-from backend.services.storage import download_bytes_from_s3
 
 logger = get_logger(__name__)
 
 
 def lambda_handler(event: Dict[str, Any], context) -> Any:
-    """Handle SQS analysis queue messages.
+    """Handle SQS messages and trigger Step Functions execution.
     
-    This Lambda function is triggered by SQS messages and orchestrates
-    the complete qPCR analysis pipeline.
+    This Lambda function is triggered by SQS messages and starts
+    the Step Functions state machine for qPCR analysis.
     
     Args:
         event: SQS event containing job information
@@ -51,56 +50,50 @@ def lambda_handler(event: Dict[str, Any], context) -> Any:
             # Get job details from DynamoDB
             job_details = _get_job_details(job_id)
             
-            # Download file from S3
-            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp_file:
-                file_data = download_bytes_from_s3(
-                    bucket=settings.RAW_BUCKET_NAME,
-                    key=file_key
-                )
-                tmp_file.write(file_data)
-                tmp_file.flush()
-                
-                # Start Step Functions execution
-                sfn_client = boto3.client('stepfunctions', region_name=settings.REGION)
-                
-                # Prepare execution input
-                execution_input = {
-                    'job_id': job_id,
-                    'file_path': tmp_file.name,
-                    'file_key': file_key,
-                    'reference_gene': job_details.get('reference_gene', 'GAPDH'),
-                    'control_condition': job_details.get('control_condition', 'CONTROL'),
-                    'experiment_name': job_details.get('experiment_name', f'Experiment_{job_id[:8]}'),
-                    'analysis_params': job_details.get('analysis_params', {}),
-                    'email': job_details.get('email'),
-                    'email_notification': job_details.get('email_notification', False)
-                }
-                
-                # Get state machine ARN from environment
+            # Start Step Functions execution
+            sfn_client = boto3.client('stepfunctions', region_name=settings.REGION)
+            
+            # Prepare execution input
+            execution_input = {
+                'job_id': job_id,
+                'file_key': file_key,
+                'reference_gene': job_details.get('reference_gene', 'GAPDH'),
+                'control_condition': job_details.get('control_condition', 'CONTROL'),
+                'experiment_name': job_details.get('experiment_name', f'Experiment_{job_id[:8]}'),
+                'analysis_params': job_details.get('analysis_params', {}),
+                'email': job_details.get('email'),
+                'email_notification': job_details.get('email_notification', False)
+            }
+            
+            # Get state machine ARN from environment or construct it
+            state_machine_arn = os.environ.get('STATE_MACHINE_ARN')
+            if not state_machine_arn:
+                # Build ARN from environment variables
                 stack_name = os.environ.get('STACK_NAME')
                 if not stack_name:
                     raise ValueError("STACK_NAME environment variable not set")
-
-                # Build state machine ARN from stack name
-                account_id = boto3.client('sts').get_caller_identity()['Account']
-                region = os.environ.get('REGION', 'us-east-1')
-                state_machine_arn = f"arn:aws:states:{region}:{account_id}:stateMachine:{stack_name}-analysis-workflow"
                 
-                # Start execution
+                account_id = boto3.client('sts').get_caller_identity()['Account']
+                region = settings.REGION
+                state_machine_arn = f"arn:aws:states:{region}:{account_id}:stateMachine:{stack_name}-analysis-workflow"
+            
+            # Start execution
+            try:
                 execution_response = sfn_client.start_execution(
                     stateMachineArn=state_machine_arn,
-                    name=f"job-{job_id}",
+                    name=f"job-{job_id}-{int(context.aws_request_id[-8:], 16)}",  # Unique name
                     input=json.dumps(execution_input)
                 )
                 
                 # Update job with execution ARN
                 _update_job_field(job_id, 'execution_arn', execution_response['executionArn'])
                 
-                logger.info(f"Started Step Functions execution for job {job_id}")
+                logger.info(f"Started Step Functions execution for job {job_id}: {execution_response['executionArn']}")
                 
-                # Clean up temp file
-                os.unlink(tmp_file.name)
-            
+            except sfn_client.exceptions.ExecutionAlreadyExists:
+                logger.warning(f"Execution already exists for job {job_id}")
+                # Don't fail - the job is already being processed
+                
         except Exception as e:
             logger.error(f"Failed to process job: {str(e)}")
             if 'job_id' in locals():
@@ -136,8 +129,16 @@ def _find_or_create_job(file_key: str) -> str:
     job_id = str(uuid.uuid4())
     timestamp = datetime.now().isoformat()
     
+    # Extract user_id from file key if present (format: raw/user_id/...)
+    user_id = 'anonymous'
+    if file_key.startswith('raw/'):
+        parts = file_key.split('/')
+        if len(parts) >= 3:
+            user_id = parts[1]
+    
     job_item = {
         'job_id': job_id,
+        'user_id': user_id,
         'status': 'PENDING',
         'created_at': timestamp,
         'updated_at': timestamp,
@@ -149,7 +150,8 @@ def _find_or_create_job(file_key: str) -> str:
             'sd_cutoff': 0.5,
             'min_proportion': 0.5,
             'significance_level': 0.05,
-            'p_adjust_method': 'fdr_bh'
+            'p_adjust_method': 'fdr_bh',
+            'generate_plots': True
         }
     }
     
@@ -219,20 +221,19 @@ def _update_job_status(
 
 
 def _update_job_field(job_id: str, field: str, value: Any) -> None:
-   """Update a specific field in the job record.
-   
-   Args:
-       job_id: Job ID
-       field: Field name to update
-       value: New value
-   """
-   settings = get_settings()
-   dynamodb = boto3.resource('dynamodb', region_name=settings.REGION)
-   table = dynamodb.Table(settings.JOB_TABLE_NAME)
-   
-   table.update_item(
-       Key={'job_id': job_id},
-       UpdateExpression=f"SET {field} = :value",
-       ExpressionAttributeValues={':value': value}
-   )
-
+    """Update a specific field in the job record.
+    
+    Args:
+        job_id: Job ID
+        field: Field name to update
+        value: New value
+    """
+    settings = get_settings()
+    dynamodb = boto3.resource('dynamodb', region_name=settings.REGION)
+    table = dynamodb.Table(settings.JOB_TABLE_NAME)
+    
+    table.update_item(
+        Key={'job_id': job_id},
+        UpdateExpression=f"SET {field} = :value",
+        ExpressionAttributeValues={':value': value}
+    )
