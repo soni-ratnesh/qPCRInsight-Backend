@@ -34,14 +34,15 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         
         # Update job status
         _update_job_status(job_id, 'QUALITY_CONTROL', progress={'step': 'quality_control', 'percentage': 20})
-        
-        # Load parsed data if it's a key
+        logger.info(f"Parsed data: {type(parsed_data)}, {parsed_data}")
+
         if isinstance(parsed_data, str):
-            parsed_data = download_json_from_s3(
-                bucket=settings.REPORT_BUCKET_NAME,
-                key=parsed_data.get('parsed_data_key', parsed_data)
-            )
-        
+            parsed_data = json.loads(parsed_data)
+      
+        parsed_data = download_json_from_s3(
+            bucket=settings.REPORT_BUCKET_NAME,
+            key=parsed_data['parsed_data_key']
+        )
         # Convert back to DataFrame
         df = pd.DataFrame(parsed_data['data'])
         

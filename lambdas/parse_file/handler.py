@@ -67,8 +67,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
             'summary': {
                 'n_samples': df['Sample Name'].nunique(),
                 'n_targets': df['Target Name'].nunique(),
-                'n_wells': len(df),
-                'has_undetermined': df['ct_undetermined'].any()
+                'n_wells': len(df)
             }
         }
         
